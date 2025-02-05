@@ -28,6 +28,43 @@ class WebViewController: UIViewController {
         setupWebView()
         loadContent()
     }
+
+        private var scrollPosition: CGPoint = .zero
+    private var positionObserver: NSKeyValueObservation?
+    
+    override func viewWillDisappear(_ animated: Bool) {
+        super.viewWillDisappear(animated)
+        saveScrollPosition()
+    }
+    
+    private func saveScrollPosition() {
+        webView.evaluateJavaScript("""
+            [window.scrollX, window.scrollY]
+        """) { [weak self] result, _ in
+            guard let self = self,
+                let position = result as? [CGFloat],
+                position.count == 2 else { return }
+            
+            CacheManager.shared.saveScrollPosition(
+                CGPoint(x: position[0], y: position[1]),
+                for: self.url
+            )
+        }
+    }
+    
+    private func restoreScrollPosition() {
+        let position = CacheManager.shared.getScrollPosition(for: url)
+        webView.evaluateJavaScript("""
+            window.scrollTo(\(position.x), \(position.y));
+        """)
+    }
+    
+    private func setupScrollObserver() {
+        positionObserver = webView.scrollView.observe(\.contentOffset) { [weak self] scrollView, _ in
+            guard let self = self else { return }
+            CacheManager.shared.saveScrollPosition(scrollView.contentOffset, for: self.url)
+        }
+    }
     
     private func setupWebView() {
         view.addSubview(webView)
@@ -38,7 +75,9 @@ class WebViewController: UIViewController {
             webView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
             webView.bottomAnchor.constraint(equalTo: view.bottomAnchor)
         ])
-        
+
+        webView.navigationDelegate = self
+
         webView.addObserver(self, forKeyPath: #keyPath(WKWebView.estimatedProgress), options: .new, context: nil)
     }
     
@@ -168,7 +207,7 @@ class CacheManager: NSObject, WKURLSchemeHandler {
             }
         }
     }
-    
+
     // 修改stop方法
     func webView(_ webView: WKWebView, stop urlSchemeTask: WKURLSchemeTask) {
         let taskID = ObjectIdentifier(urlSchemeTask)
@@ -191,5 +230,34 @@ class CacheManager: NSObject, WKURLSchemeHandler {
                 self.activeTasks.removeValue(forKey: taskID)
             }
         }
+    }
+
+    // 添加滚动位置存储功能
+    private func scrollPositionKey(for url: URL) -> String {
+        return "scroll_\(cacheKey(for: url))"
+    }
+    
+    func saveScrollPosition(_ position: CGPoint, for url: URL) {
+        let data = try? NSKeyedArchiver.archivedData(
+            withRootObject: position,
+            requiringSecureCoding: false
+        )
+        UserDefaults.standard.set(data, forKey: scrollPositionKey(for: url))
+    }
+    
+    func getScrollPosition(for url: URL) -> CGPoint {
+        guard let data = UserDefaults.standard.data(forKey: scrollPositionKey(for: url)),
+            let position = try? NSKeyedUnarchiver.unarchivedObject(ofClass: NSValue.self, from: data)
+        else {
+            return .zero
+        }
+        return position.cgPointValue
+    }
+}
+
+extension WebViewController: WKNavigationDelegate {
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        restoreScrollPosition()
+        setupScrollObserver()
     }
 }
