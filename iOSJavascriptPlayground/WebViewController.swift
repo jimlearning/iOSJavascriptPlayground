@@ -8,63 +8,66 @@
 import UIKit
 import WebKit
 
+/** 缓存处理逻辑
+ * 1. 初次加载 → 立即设置目标位置 → 内容加载后校准 → 正确恢复 ✅
+ * 2. 用户滚动 → 实时保存新位置 ✅
+ * 3. 内容更新 → 保持用户当前滚动位置 ✅
+ * 4. 重新打开 → 恢复上次退出时的位置 ✅
+ */
+
 class WebViewController: UIViewController {
+    
+    // MARK: - 属性声明
     
     let webView: WKWebView
     let url: URL
     let progressView = UIProgressView(progressViewStyle: .bar)
     
+    /// 滚动位置锁定状态
+    private var positionLock = false
+    /// 初始加载标识
+    private var isInitialLoad = true
+    /// 滚动位置观察者
+    private var positionObserver: NSKeyValueObservation?
+    /// 当前滚动位置
+    private var scrollPosition: CGPoint = .zero
+    /// url scheme
+    private let urlScheme = "cachedhttp"
+    
+    // MARK: - 初始化方法
+    
     init(url: URL) {
         self.url = url
         let config = WKWebViewConfiguration()
-        config.setURLSchemeHandler(CacheManager.shared, forURLScheme: "cachedhttp")
+        config.setURLSchemeHandler(WebCacheManager.shared, forURLScheme: urlScheme)
         self.webView = WKWebView(frame: .zero, configuration: config)
         super.init(nibName: nil, bundle: nil)
+    }
+    
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+    
+    deinit {
+        removeObservers()
     }
     
     override func viewDidLoad() {
         super.viewDidLoad()
         view.backgroundColor = .systemBackground
         setupWebView()
+        addObservers()
         loadContent()
     }
-
-        private var scrollPosition: CGPoint = .zero
-    private var positionObserver: NSKeyValueObservation?
     
     override func viewWillDisappear(_ animated: Bool) {
         super.viewWillDisappear(animated)
         saveScrollPosition()
     }
     
-    private func saveScrollPosition() {
-        webView.evaluateJavaScript("""
-            [window.scrollX, window.scrollY]
-        """) { [weak self] result, _ in
-            guard let self = self,
-                let position = result as? [CGFloat],
-                position.count == 2 else { return }
-            
-            CacheManager.shared.saveScrollPosition(
-                CGPoint(x: position[0], y: position[1]),
-                for: self.url
-            )
-        }
-    }
+    // MARK: - 配置方法
     
-    private func restoreScrollPosition() {
-        let position = CacheManager.shared.getScrollPosition(for: url)
-        webView.evaluateJavaScript("""
-            window.scrollTo(\(position.x), \(position.y));
-        """)
-    }
-    
-    private func setupScrollObserver() {
-        positionObserver = webView.scrollView.observe(\.contentOffset) { [weak self] scrollView, _ in
-            guard let self = self else { return }
-            CacheManager.shared.saveScrollPosition(scrollView.contentOffset, for: self.url)
-        }
-    }
+    /// 配置WebView基础属性
     
     private func setupWebView() {
         view.addSubview(webView)
@@ -75,189 +78,162 @@ class WebViewController: UIViewController {
             webView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
             webView.bottomAnchor.constraint(equalTo: view.bottomAnchor)
         ])
-
+        
         webView.navigationDelegate = self
+        webView.scrollView.delegate = self
+        
+        view.addSubview(progressView)
+        progressView.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            progressView.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
+            progressView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            progressView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            progressView.heightAnchor.constraint(equalToConstant: 1),
+        ])
+    }
+}
 
+extension WebViewController {
+    
+    // MARK: - 核心业务逻辑
+    
+    /// 加载内容主方法
+    private func loadContent() {
+        guard let cachedURL = url.withScheme(urlScheme) else { return }
+        
+        handleInitialLoad(cachedURL: cachedURL)
+        fetchAndUpdateContent(cachedURL: cachedURL)
+        isInitialLoad = false
+    }
+    
+    /// 处理初始加载逻辑
+    private func handleInitialLoad(cachedURL: URL) {
+        guard isInitialLoad else { return }
+        
+        let targetPosition = WebCacheManager.shared.getScrollPosition(for: url)
+        positionLock = true
+        webView.scrollView.setContentOffset(targetPosition, animated: false)
+        
+        loadCachedContent(cachedURL: cachedURL)
+    }
+    
+    /// 加载缓存内容
+    private func loadCachedContent(cachedURL: URL) {
+        guard let cachedData = WebCacheManager.shared.getCachedData(for: url) else { return }
+        webView.load(cachedData, mimeType: "text/html", characterEncodingName: "utf-8", baseURL: cachedURL)
+    }
+    
+    /// 获取并更新内容
+    private func fetchAndUpdateContent(cachedURL: URL) {
+        URLSession.shared.dataTask(with: url) { [weak self] data, response, _ in
+            guard let self = self, let data = data else { return }
+            WebCacheManager.shared.updateCache(for: self.url, data: data)
+            
+            DispatchQueue.main.async {
+                self.handleContentUpdate(cachedURL: cachedURL)
+            }
+        }.resume()
+    }
+    
+    /// 处理内容更新
+    private func handleContentUpdate(cachedURL: URL) {
+        guard let cachedData = WebCacheManager.shared.getCachedData(for: url) else {
+            return
+        }
+        UIView.performWithoutAnimation {
+            let currentOffset = webView.scrollView.contentOffset
+            webView.load(cachedData, mimeType: "text/html", characterEncodingName: "utf-8", baseURL: cachedURL)
+            webView.scrollView.setContentOffset(currentOffset, animated: false)
+        }
+    }
+    
+    /// 保存滚动位置
+    private func saveScrollPosition() {
+        let javaScriptString = "[window.scrollX, window.scrollY]"
+        webView.evaluateJavaScript(javaScriptString) { [weak self] result, _ in
+            guard let self = self,
+                  let position = result as? [CGFloat],
+                  position.count == 2 else { return }
+            
+            WebCacheManager.shared.saveScrollPosition(
+                CGPoint(x: position[0], y: position[1]),
+                for: self.url
+            )
+        }
+    }
+}
+
+// MARK: - KVO观察者方法
+
+extension WebViewController {
+    
+    func addObservers() {
         webView.addObserver(self, forKeyPath: #keyPath(WKWebView.estimatedProgress), options: .new, context: nil)
     }
     
-    private func loadContent() {
-        guard let cachedURL = url.withScheme("cachedhttp") else {
-            print("Invalid URL scheme conversion")
-            return
-        }
-        
-        let cachedRequest = URLRequest(url: cachedURL)
-        webView.load(cachedRequest)
-
-        // 后台更新缓存（保持不变）
-        URLSession.shared.dataTask(with: url) { data, response, _ in
-            guard let data = data else { return }
-            CacheManager.shared.updateCache(for: self.url, data: data)
-            DispatchQueue.main.async {
-                self.webView.load(cachedRequest)
-            }
-        }.resume()
-    }
-    
-    override func observeValue(forKeyPath keyPath: String?, of object: Any?, change: [NSKeyValueChangeKey : Any]?, context: UnsafeMutableRawPointer?) {
-        if keyPath == "estimatedProgress" {
-            progressView.progress = Float(webView.estimatedProgress)
-        }
-    }
-    
-    deinit {
+    func removeObservers() {
         webView.removeObserver(self, forKeyPath: #keyPath(WKWebView.estimatedProgress))
     }
     
-    required init?(coder: NSCoder) {
-        fatalError("init(coder:) has not been implemented")
+    override func observeValue(forKeyPath keyPath: String?, of object: Any?, change: [NSKeyValueChangeKey : Any]?, context: UnsafeMutableRawPointer?) {
+        guard keyPath == "estimatedProgress" else { return }
+        let progress =  Float(webView.estimatedProgress)
+        progressView.progress = progress
+        progressView.isHidden = progress >= 1.0
     }
 }
 
-// CacheManager.swift - 缓存管理
-class CacheManager: NSObject, WKURLSchemeHandler {
-    
-    static let shared = CacheManager()
-    private let fileManager = FileManager.default
-    private let cacheDirectory: URL
-    
-    private override init() {
-        let paths = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)
-        cacheDirectory = paths[0].appendingPathComponent("WebCache")
-        super.init()
-        try? fileManager.createDirectory(at: cacheDirectory, withIntermediateDirectories: true)
-    }
-    
-    // MARK: - 缓存处理
-    func cacheKey(for url: URL) -> String {
-        return url.absoluteString.sha256() // 需要添加SHA256扩展
-    }
-    
-    func getCachedData(for url: URL) -> Data? {
-        let fileURL = cacheDirectory.appendingPathComponent(cacheKey(for: url))
-        print("缓存路径：\(fileURL.path)") // 添加调试日志
-        return try? Data(contentsOf: fileURL)
-    }
-    
-    func updateCache(for url: URL, data: Data) {
-        let fileURL = cacheDirectory.appendingPathComponent(cacheKey(for: url))
-        try? data.write(to: fileURL)
-    }
-    
-    private var activeTasks = [ObjectIdentifier: WKURLSchemeTask]()
-    private let taskQueue = DispatchQueue(label: "com.cachemanager.taskqueue")
-    
-    // 修改start方法
-    func webView(_ webView: WKWebView, start urlSchemeTask: WKURLSchemeTask) {
-        let taskID = ObjectIdentifier(urlSchemeTask)
-        taskQueue.sync {
-            activeTasks[taskID] = urlSchemeTask
-        }
-        
-        guard let url = urlSchemeTask.request.url else { return }
-        let originalURL = url.withScheme("http")!
-        
-        if let cachedData = getCachedData(for: originalURL) {
-            sendResponse(data: cachedData, to: urlSchemeTask, taskID: taskID)
-            return
-        }
-        
-        URLSession.shared.dataTask(with: originalURL) { [weak self, taskID] data, response, error in
-            guard let self = self else { return }
-            
-            self.taskQueue.sync {
-                guard self.activeTasks[taskID] != nil else { return }
-            }
-            
-            guard let data = data else {
-                self.sendError(to: urlSchemeTask, taskID: taskID)
-                return
-            }
-            
-            self.updateCache(for: originalURL, data: data)
-            self.sendResponse(data: data, to: urlSchemeTask, taskID: taskID)
-        }.resume()
-    }
-    
-    // 修改sendResponse方法
-    private func sendResponse(data: Data, to task: WKURLSchemeTask, taskID: ObjectIdentifier) {
-        taskQueue.sync {
-            guard activeTasks[taskID] != nil else { return }
-            
-            let response = URLResponse(
-                url: task.request.url!,
-                mimeType: "text/html",
-                expectedContentLength: data.count,
-                textEncodingName: "utf-8"
-            )
-            
-            DispatchQueue.main.async {
-                self.taskQueue.sync {
-                    guard self.activeTasks[taskID] != nil else { return }
-                }
-                
-                task.didReceive(response)
-                task.didReceive(data)
-                task.didFinish()
-                
-                _ = self.taskQueue.sync {
-                    self.activeTasks.removeValue(forKey: taskID)
-                }
-            }
-        }
-    }
-
-    // 修改stop方法
-    func webView(_ webView: WKWebView, stop urlSchemeTask: WKURLSchemeTask) {
-        let taskID = ObjectIdentifier(urlSchemeTask)
-        _ = taskQueue.sync {
-            activeTasks.removeValue(forKey: taskID)
-        }
-    }
-    
-    private func sendError(to task: WKURLSchemeTask,  taskID: ObjectIdentifier) {
-        taskQueue.sync {
-            guard activeTasks[taskID] != nil else { return }
-            
-            let error = NSError(domain: "CacheManagerError", code: 500, userInfo: [
-                NSLocalizedDescriptionKey: "Failed to load resource"
-            ])
-            
-            DispatchQueue.main.async {
-                guard self.activeTasks[taskID] != nil else { return }
-                task.didFailWithError(error)
-                self.activeTasks.removeValue(forKey: taskID)
-            }
-        }
-    }
-
-    // 添加滚动位置存储功能
-    private func scrollPositionKey(for url: URL) -> String {
-        return "scroll_\(cacheKey(for: url))"
-    }
-    
-    func saveScrollPosition(_ position: CGPoint, for url: URL) {
-        let data = try? NSKeyedArchiver.archivedData(
-            withRootObject: position,
-            requiringSecureCoding: false
-        )
-        UserDefaults.standard.set(data, forKey: scrollPositionKey(for: url))
-    }
-    
-    func getScrollPosition(for url: URL) -> CGPoint {
-        guard let data = UserDefaults.standard.data(forKey: scrollPositionKey(for: url)),
-            let position = try? NSKeyedUnarchiver.unarchivedObject(ofClass: NSValue.self, from: data)
-        else {
-            return .zero
-        }
-        return position.cgPointValue
-    }
-}
+// MARK: - WKNavigationDelegate 导航代理
 
 extension WebViewController: WKNavigationDelegate {
+    
+    func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
+        positionLock = true
+    }
+    
+    func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
+        // 阶段3：内容提交时锁定
+        let targetPosition = WebCacheManager.shared.getScrollPosition(for: url)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+            webView.scrollView.setContentOffset(targetPosition, animated: false)
+        }
+    }
+
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-        restoreScrollPosition()
-        setupScrollObserver()
+        guard isInitialLoad else { return }
+        
+        // 缩短校准延迟并确保释放锁定
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+            self.positionLock = false
+            self.isInitialLoad = false
+            // 最终校准改为异步JavaScript执行
+            let targetPosition = WebCacheManager.shared.getScrollPosition(for: self.url)
+            self.webView.evaluateJavaScript("window.scrollTo(\(targetPosition.x), \(targetPosition.y))")
+        }
+    }
+}
+
+// MARK: - UIScrollViewDelegate 滚动代理
+
+extension WebViewController: UIScrollViewDelegate {
+    
+    // 处理滚动事件
+    func scrollViewDidScroll(_ scrollView: UIScrollView) {
+        if positionLock {
+            // 仅在加载阶段强制保持位置
+            scrollView.setContentOffset(
+                WebCacheManager.shared.getScrollPosition(for: url),
+                animated: false
+            )
+        } else {
+            // 实时保存用户滚动的位置
+            WebCacheManager.shared.saveScrollPosition(scrollView.contentOffset, for: url)
+        }
+    }
+    
+    // 新增方法：处理滚动开始事件
+    func scrollViewWillBeginDragging(_ scrollView: UIScrollView) {
+        // 用户开始手动滚动时立即释放锁定
+        positionLock = false
     }
 }
