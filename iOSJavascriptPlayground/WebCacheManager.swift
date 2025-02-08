@@ -7,6 +7,10 @@
 
 import Foundation
 import WebKit
+import CryptoKit
+
+/// url scheme
+let urlScheme = "cachedhttp"
 
 // 缓存管理
 class WebCacheManager: NSObject {
@@ -33,10 +37,25 @@ class WebCacheManager: NSObject {
 
 extension WebCacheManager {
     
+    // 计算数据哈希
+    func calculateHash(for data: Data) -> String {
+        return SHA256.hash(data: data).map { String(format: "%02hhx", $0) }.joined()
+    }
+    
     func getCachedData(for url: URL) -> Data? {
         let fileURL = cacheDirectory.appendingPathComponent(cacheKey(for: url))
         print("缓存路径：\(fileURL.path)") // 添加调试日志
         return try? Data(contentsOf: fileURL)
+    }
+    
+    func updateCacheIfNeeded(for url: URL, data: Data) -> Bool {
+        let newHash = calculateHash(for: data)
+        let oldHash = getCachedData(for: url).flatMap { calculateHash(for: $0) }
+        if oldHash == newHash {
+            return false
+        }
+        updateCache(for: url, data: data)
+        return true
     }
     
     func updateCache(for url: URL, data: Data) {
@@ -85,7 +104,7 @@ extension WebCacheManager: WKURLSchemeHandler {
         }
         
         guard let url = urlSchemeTask.request.url else { return }
-        let originalURL = url.withScheme("http")!
+        let originalURL = url.withScheme(urlScheme)!
         
         if let cachedData = getCachedData(for: originalURL) {
             sendResponse(data: cachedData, to: urlSchemeTask, taskID: taskID)

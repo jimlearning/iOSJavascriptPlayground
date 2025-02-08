@@ -31,8 +31,8 @@ class WebViewController: UIViewController {
     private var positionObserver: NSKeyValueObservation?
     /// 当前滚动位置
     private var scrollPosition: CGPoint = .zero
-    /// url scheme
-    private let urlScheme = "cachedhttp"
+    
+    private var isForceUpdate = false
     
     // MARK: - 初始化方法
     
@@ -90,6 +90,17 @@ class WebViewController: UIViewController {
             progressView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
             progressView.heightAnchor.constraint(equalToConstant: 1),
         ])
+        
+        let rightItem = UIBarButtonItem(barButtonSystemItem: .refresh, target: self, action: #selector(refresh))
+        navigationItem.rightBarButtonItem = rightItem
+    }
+    
+    @objc private func refresh() {
+        guard let cachedURL = url.withScheme(urlScheme) else {
+            return
+        }
+        isForceUpdate = true
+        fetchAndUpdateContent(cachedURL: cachedURL)
     }
 }
 
@@ -126,11 +137,19 @@ extension WebViewController {
     /// 获取并更新内容
     private func fetchAndUpdateContent(cachedURL: URL) {
         URLSession.shared.dataTask(with: url) { [weak self] data, response, _ in
-            guard let self = self, let data = data else { return }
-            WebCacheManager.shared.updateCache(for: self.url, data: data)
+            guard let self = self, let data = data else {
+                return
+            }
+            
+            let isUpdated = WebCacheManager.shared.updateCacheIfNeeded(for: self.url, data: data)
+            let shouldUpdate = isForceUpdate || isUpdated
+            guard shouldUpdate else {
+                return
+            }
             
             DispatchQueue.main.async {
                 self.handleContentUpdate(cachedURL: cachedURL)
+                self.isForceUpdate = false
             }
         }.resume()
     }
